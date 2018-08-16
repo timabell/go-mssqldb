@@ -2,14 +2,14 @@ package mssql
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"testing"
 	"time"
-
-	"golang.org/x/net/context"
 )
 
 type MockTransport struct {
@@ -72,13 +72,13 @@ func TestSendLogin(t *testing.T) {
 
 func TestSendSqlBatch(t *testing.T) {
 	checkConnStr(t)
-	p, err := parseConnectParams(makeConnStr())
+	p, err := parseConnectParams(makeConnStr(t).String())
 	if err != nil {
 		t.Error("parseConnectParams failed:", err.Error())
 		return
 	}
 
-	conn, err := connect(optionalLogger{testLogger{t}}, p)
+	conn, err := connect(context.Background(), optionalLogger{testLogger{t}}, p)
 	if err != nil {
 		t.Error("Open connection failed:", err.Error())
 		return
@@ -89,14 +89,14 @@ func TestSendSqlBatch(t *testing.T) {
 		{hdrtype: dataStmHdrTransDescr,
 			data: transDescrHdr{0, 1}.pack()},
 	}
-	err = sendSqlBatch72(conn.buf, "select 1", headers)
+	err = sendSqlBatch72(conn.buf, "select 1", headers, true)
 	if err != nil {
 		t.Error("Sending sql batch failed", err.Error())
 		return
 	}
 
 	ch := make(chan tokenStruct, 5)
-	go processResponse(context.Background(), conn, ch)
+	go processResponse(context.Background(), conn, ch, nil)
 
 	var lastRow []interface{}
 loop:
@@ -127,21 +127,41 @@ loop:
 }
 
 func checkConnStr(t *testing.T) {
+	if len(os.Getenv("SQLSERVER_DSN")) > 0 {
+		return
+	}
 	if len(os.Getenv("HOST")) > 0 && len(os.Getenv("DATABASE")) > 0 {
 		return
 	}
 	t.Skip("no database connection string")
 }
 
-func makeConnStr() string {
-	addr := os.Getenv("HOST")
-	instance := os.Getenv("INSTANCE")
-	user := os.Getenv("SQLUSER")
-	password := os.Getenv("SQLPASSWORD")
-	database := os.Getenv("DATABASE")
-	return fmt.Sprintf(
-		"Server=%s\\%s;User Id=%s;Password=%s;Database=%s;log=127",
-		addr, instance, user, password, database)
+// makeConnStr returns a URL struct so it may be modified by various
+// tests before used as a DSN.
+func makeConnStr(t *testing.T) *url.URL {
+	dsn := os.Getenv("SQLSERVER_DSN")
+	if len(dsn) > 0 {
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatal("unable to parse SQLSERVER_DSN as URL", err)
+		}
+		values := parsed.Query()
+		if values.Get("log") == "" {
+			values.Set("log", "127")
+		}
+		parsed.RawQuery = values.Encode()
+		return parsed
+	}
+	values := url.Values{}
+	values.Set("log", "127")
+	values.Set("database", os.Getenv("DATABASE"))
+	return &url.URL{
+		Scheme:   "sqlserver",
+		Host:     os.Getenv("HOST"),
+		Path:     os.Getenv("INSTANCE"),
+		User:     url.UserPassword(os.Getenv("SQLUSER"), os.Getenv("SQLPASSWORD")),
+		RawQuery: values.Encode(),
+	}
 }
 
 type testLogger struct {
@@ -159,7 +179,7 @@ func (l testLogger) Println(v ...interface{}) {
 func open(t *testing.T) *sql.DB {
 	checkConnStr(t)
 	SetLogger(testLogger{t})
-	conn, err := sql.Open("mssql", makeConnStr())
+	conn, err := sql.Open("mssql", makeConnStr(t).String())
 	if err != nil {
 		t.Error("Open connection failed:", err.Error())
 		return nil
@@ -171,32 +191,12 @@ func open(t *testing.T) *sql.DB {
 func TestConnect(t *testing.T) {
 	checkConnStr(t)
 	SetLogger(testLogger{t})
-	conn, err := sql.Open("mssql", makeConnStr())
+	conn, err := sql.Open("mssql", makeConnStr(t).String())
 	if err != nil {
 		t.Error("Open connection failed:", err.Error())
 		return
 	}
 	defer conn.Close()
-}
-
-func TestBadConnect(t *testing.T) {
-	badDsns := []string{
-		//"Server=badhost",
-		fmt.Sprintf("Server=%s\\%s;User ID=baduser;Password=badpwd",
-			os.Getenv("HOST"), os.Getenv("INSTANCE")),
-	}
-	SetLogger(testLogger{t})
-	for _, badDsn := range badDsns {
-		conn, err := sql.Open("mssql", badDsn)
-		if err != nil {
-			t.Error("Open connection failed:", err.Error())
-		}
-		defer conn.Close()
-		err = conn.Ping()
-		if err == nil {
-			t.Error("Ping should fail for connection: ", badDsn)
-		}
-	}
 }
 
 func simpleQuery(conn *sql.DB, t *testing.T) (stmt *sql.Stmt) {
@@ -321,8 +321,15 @@ func TestPing(t *testing.T) {
 func TestSecureWithInvalidHostName(t *testing.T) {
 	checkConnStr(t)
 	SetLogger(testLogger{t})
-	dsn := makeConnStr() + ";Encrypt=true;TrustServerCertificate=false;hostNameInCertificate=foo.bar"
-	conn, err := sql.Open("mssql", dsn)
+
+	dsn := makeConnStr(t)
+	dsnParams := dsn.Query()
+	dsnParams.Set("encrypt", "true")
+	dsnParams.Set("TrustServerCertificate", "false")
+	dsnParams.Set("hostNameInCertificate", "foo.bar")
+	dsn.RawQuery = dsnParams.Encode()
+
+	conn, err := sql.Open("mssql", dsn.String())
 	if err != nil {
 		t.Fatal("Open connection failed:", err.Error())
 	}
@@ -336,8 +343,14 @@ func TestSecureWithInvalidHostName(t *testing.T) {
 func TestSecureConnection(t *testing.T) {
 	checkConnStr(t)
 	SetLogger(testLogger{t})
-	dsn := makeConnStr() + ";Encrypt=true;TrustServerCertificate=true"
-	conn, err := sql.Open("mssql", dsn)
+
+	dsn := makeConnStr(t)
+	dsnParams := dsn.Query()
+	dsnParams.Set("encrypt", "true")
+	dsnParams.Set("TrustServerCertificate", "true")
+	dsn.RawQuery = dsnParams.Encode()
+
+	conn, err := sql.Open("mssql", dsn.String())
 	if err != nil {
 		t.Fatal("Open connection failed:", err.Error())
 	}
@@ -486,5 +499,24 @@ func TestValidConnectionString(t *testing.T) {
 		if !ts.check(p) {
 			t.Errorf("Check failed on conn str %s", ts.connStr)
 		}
+	}
+}
+
+func TestBadConnect(t *testing.T) {
+	checkConnStr(t)
+	SetLogger(testLogger{t})
+	connURL := makeConnStr(t)
+	connURL.User = url.UserPassword("baduser", "badpwd")
+	badDSN := connURL.String()
+
+	conn, err := sql.Open("mssql", badDSN)
+	if err != nil {
+		t.Error("Open connection failed:", err.Error())
+	}
+	defer conn.Close()
+
+	err = conn.Ping()
+	if err == nil {
+		t.Error("Ping should fail for connection: ", badDSN)
 	}
 }
